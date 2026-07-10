@@ -23,8 +23,7 @@
         public bool IsFrameStart { get; }
 
         internal byte WindowDescriptor;         //window-descriptor byte for the synthetic frame header (mid-frame points)
-        internal byte[] SpanMd5 = [];           //MD5 of the uncompressed span [this point, next point)
-        internal long WindowPositionInFile;     //where this point's zstd-compressed window sits in the index file
+        internal long WindowPositionInFile;     //where this point's zstd-compressed window sits, relative to the index's first byte
         internal int WindowCompressedLength;    //0 = no window (frame starts)
 
         internal ZstdIndexPoint(long uncompressedOffset, long compressedOffset, bool isFrameStart, byte windowDescriptor)

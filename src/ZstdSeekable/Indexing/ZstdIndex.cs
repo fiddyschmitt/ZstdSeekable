@@ -1,11 +1,9 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using ZstdSeekable.Internal;
 using ZstdSharp.Unsafe;
@@ -15,20 +13,33 @@ namespace ZstdSeekable
     /// <summary>
     /// Random-access index over a standard (non-seekable-format) zstd stream: verified resume points
     /// every ~<see cref="ZstdIndexOptions.TargetSpanBytes"/> of output, each carrying the preceding
-    /// ≤windowSize of content (zstd-compressed in the index, loaded lazily). Built by one sequential
-    /// decode with inline trial-validation of every candidate point, then a parallel whole-span
-    /// verification pass; only points whose resumed decode is byte-identical to the true decode
-    /// survive. The persisted format is binary, magic "ZSTZRAN1", all integers little-endian.
+    /// ≤windowSize of content (zstd-compressed in the index, loaded lazily).
+    ///
+    /// Built in a SINGLE sequential pass: at any moment two shadow decoders run alongside the true
+    /// decode - one for the last confirmed point (insurance covering its still-open span) and one for
+    /// the current candidate. A candidate that survives a full span byte-identical is confirmed,
+    /// which seals its predecessor (span fully verified by the insurance shadow) and - when building
+    /// to a file or seekable stream - appends it to the destination immediately, keeping build
+    /// memory flat. A diverging candidate is simply re-armed at a later boundary. A diverging
+    /// CONFIRMED shadow (divergence deeper than a whole span; never yet observed on real data)
+    /// triggers a rebuild with frame-start points only: never wrong data, at worst a coarse index.
+    ///
+    /// A persisted index grows incrementally (header counts zeroed until finalisation), so an
+    /// interrupted build RESUMES: sealed points are kept, and the build fast-forwards from the last
+    /// sealed frame-start point (a frame-start resume IS the true decode, so the verification truth
+    /// chain stays rooted). The persisted format is binary ("ZSTZRAN2"; "ZSTZRAN1" files from older
+    /// versions still load), all integers little-endian.
     /// </summary>
     public sealed class ZstdIndex : IDisposable
     {
-        const int TrialLookaheadBytes = 4 * 1024 * 1024;    //inline candidate validation depth (the verify pass then covers full spans)
-        const int RecordSize = 8 + 8 + 1 + 1 + 16 + 8 + 4;
-        const int HeaderSize = 8 + 8 + 4;
-        static readonly byte[] Magic = "ZSTZRAN1"u8.ToArray();
+        static readonly byte[] MagicV1 = "ZSTZRAN1"u8.ToArray();
+        static readonly byte[] MagicV2 = "ZSTZRAN2"u8.ToArray();
+        const int HeaderSize = 8 + 8 + 4;                   //magic, totalUncompressed, pointCount (both formats)
+        const int RecordSizeV1 = 8 + 8 + 1 + 1 + 16 + 8 + 4;
+        const int RecordSizeV2 = 8 + 8 + 1 + 1 + 4;         //fixed part; the compressed window follows inline
 
-        List<ZstdIndexPoint> points;
-        WindowSource windowSource;
+        readonly List<ZstdIndexPoint> points;
+        readonly WindowSource windowSource;
 
         /// <summary>The verified resume points, in stream order. The first point is always offset 0.</summary>
         public IReadOnlyList<ZstdIndexPoint> Points => points;
@@ -57,20 +68,20 @@ namespace ZstdSeekable
             return decompressor.Unwrap(stored).ToArray();
         }
 
-        //================================================================= load / save
+        //================================================================= load
 
-        /// <summary>Loads an index from a file. Window snapshots are read lazily (the file is opened
-        /// per window load), so the file must remain in place while the index is in use.</summary>
+        /// <summary>Loads an index from a file (either format version). Window snapshots are read
+        /// lazily (the file is opened per window load), so the file must remain in place while the
+        /// index is in use.</summary>
         public static ZstdIndex Load(string indexPath)
         {
-            List<ZstdIndexPoint> loaded;
-            long totalLength;
+            ParsedIndex parsed;
             using (var fs = File.OpenRead(indexPath))
-            using (var br = new BinaryReader(fs))
             {
-                (loaded, totalLength) = ReadHeaderAndRecords(br);
+                parsed = Parse(fs, eagerWindows: null, tolerateTruncatedTail: false);
             }
-            return new ZstdIndex(loaded, totalLength, new FileWindowSource(indexPath));
+            if (!parsed.Complete) throw new InvalidDataException("The zstd index was not finalised (interrupted build). LoadOrBuild can resume it.");
+            return new ZstdIndex(parsed.Points, parsed.TotalLength, new FileWindowSource(indexPath));
         }
 
         /// <summary>
@@ -85,63 +96,167 @@ namespace ZstdSeekable
             if (indexStream.CanSeek)
             {
                 var baseOffset = indexStream.Position;
-                using var br = new BinaryReader(indexStream, Encoding.UTF8, leaveOpen: true);
-                var (loaded, totalLength) = ReadHeaderAndRecords(br);
-                return new ZstdIndex(loaded, totalLength, new StreamWindowSource(indexStream, baseOffset, leaveOpen));
+                var parsed = Parse(indexStream, eagerWindows: null, tolerateTruncatedTail: false);
+                if (!parsed.Complete) throw new InvalidDataException("The zstd index was not finalised (interrupted build). LoadOrBuild can resume it.");
+                return new ZstdIndex(parsed.Points, parsed.TotalLength, new StreamWindowSource(indexStream, baseOffset, leaveOpen));
             }
             else
             {
-                using var br = new BinaryReader(indexStream, Encoding.UTF8, leaveOpen: true);
-                var (loaded, totalLength) = ReadHeaderAndRecords(br);
-
-                //windows are concatenated after the records in point order - read them all now
                 var windows = new Dictionary<ZstdIndexPoint, byte[]>();
-                foreach (var point in loaded)
-                {
-                    if (point.WindowCompressedLength == 0) continue;
-                    windows[point] = br.ReadBytes(point.WindowCompressedLength);
-                    if (windows[point].Length < point.WindowCompressedLength)
-                        throw new InvalidDataException("Truncated zstd index (windows).");
-                }
+                var parsed = Parse(indexStream, eagerWindows: windows, tolerateTruncatedTail: false);
+                if (!parsed.Complete) throw new InvalidDataException("The zstd index was not finalised (interrupted build). LoadOrBuild can resume it.");
                 if (!leaveOpen) indexStream.Dispose();
-                return new ZstdIndex(loaded, totalLength, new MemoryWindowSource(windows));
+                return new ZstdIndex(parsed.Points, parsed.TotalLength, new MemoryWindowSource(windows));
             }
         }
 
-        static (List<ZstdIndexPoint> Points, long TotalLength) ReadHeaderAndRecords(BinaryReader br)
+        struct ParsedIndex
         {
-            if (!br.ReadBytes(8).AsSpan().SequenceEqual(Magic)) throw new InvalidDataException("Not a zstd random-access index (bad magic).");
-            var totalLength = br.ReadInt64();
-            var count = br.ReadInt32();
+            public List<ZstdIndexPoint> Points;
+            public long TotalLength;
+            public bool Complete;
+        }
+
+        /// <summary>
+        /// Reads either format version from the stream's current position. Window positions in the
+        /// returned points are relative to that position. When <paramref name="eagerWindows"/> is
+        /// non-null the window bytes are collected into it (required for non-seekable streams);
+        /// otherwise they are skipped. <paramref name="tolerateTruncatedTail"/>: an unfinalised v2
+        /// index may end mid-record after an interruption - keep the complete points instead of
+        /// throwing (used to resume builds).
+        /// </summary>
+        static ParsedIndex Parse(Stream s, Dictionary<ZstdIndexPoint, byte[]>? eagerWindows, bool tolerateTruncatedTail)
+        {
+            var header = new byte[HeaderSize];
+            if (ReadUpTo(s, header, HeaderSize) < HeaderSize) throw new InvalidDataException("zstd index truncated (header).");
+
+            var totalLength = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(8));
+            var count = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(16));
+
+            if (header.AsSpan(0, 8).SequenceEqual(MagicV2)) return ParseV2(s, totalLength, count, eagerWindows, tolerateTruncatedTail);
+            if (header.AsSpan(0, 8).SequenceEqual(MagicV1)) return ParseV1(s, totalLength, count, eagerWindows);
+            throw new InvalidDataException("Not a zstd random-access index (bad magic).");
+        }
+
+        //v1 ("ZSTZRAN1", pre-0.2.0 and older clonezilla-util): fixed records carrying a span MD5 and
+        //an absolute window position, followed by a blob of all windows in point order
+        static ParsedIndex ParseV1(Stream s, long totalLength, int count, Dictionary<ZstdIndexPoint, byte[]>? eagerWindows)
+        {
             if (count <= 0) throw new InvalidDataException("zstd index has no points.");
 
             var loaded = new List<ZstdIndexPoint>(count);
+            var record = new byte[RecordSizeV1];
             for (var i = 0; i < count; i++)
             {
-                var uncompressedOffset = br.ReadInt64();
-                var compressedOffset = br.ReadInt64();
-                var isFrameStart = br.ReadBoolean();
-                var windowDescriptor = br.ReadByte();
-                var spanMd5 = br.ReadBytes(16);
-                var windowPositionInFile = br.ReadInt64();
-                var windowCompressedLength = br.ReadInt32();
-                if (spanMd5.Length < 16) throw new InvalidDataException("Truncated zstd index (records).");
+                if (ReadUpTo(s, record, RecordSizeV1) < RecordSizeV1) throw new InvalidDataException("zstd index truncated (records).");
 
-                loaded.Add(new ZstdIndexPoint(uncompressedOffset, compressedOffset, isFrameStart, windowDescriptor)
+                loaded.Add(new ZstdIndexPoint(
+                    uncompressedOffset: BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(0)),
+                    compressedOffset: BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(8)),
+                    isFrameStart: record[16] != 0,
+                    windowDescriptor: record[17])
                 {
-                    SpanMd5 = spanMd5,
-                    WindowPositionInFile = windowPositionInFile,
-                    WindowCompressedLength = windowCompressedLength,
+                    //bytes 18..33 are the span MD5, used only by the old two-pass builder - discarded
+                    WindowPositionInFile = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(34)),
+                    WindowCompressedLength = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(42)),
                 });
             }
-            return (loaded, totalLength);
+
+            if (eagerWindows != null)
+            {
+                //the windows sit after the records, concatenated in point order
+                foreach (var point in loaded)
+                {
+                    if (point.WindowCompressedLength <= 0) continue;
+                    var window = new byte[point.WindowCompressedLength];
+                    if (ReadUpTo(s, window, window.Length) < window.Length) throw new InvalidDataException("zstd index truncated (windows).");
+                    eagerWindows[point] = window;
+                }
+            }
+
+            return new ParsedIndex { Points = loaded, TotalLength = totalLength, Complete = true };
         }
 
+        //v2 ("ZSTZRAN2", 0.2.0+ and current clonezilla-util): each fixed record is followed
+        //immediately by its compressed window; zeroed header counts mark an unfinalised index
+        static ParsedIndex ParseV2(Stream s, long totalLength, int count, Dictionary<ZstdIndexPoint, byte[]>? eagerWindows, bool tolerateTruncatedTail)
+        {
+            var complete = count > 0;
+            var loaded = new List<ZstdIndexPoint>();
+            var record = new byte[RecordSizeV2];
+            long offset = HeaderSize;   //relative to the index's first byte
+
+            while (complete ? loaded.Count < count : true)
+            {
+                var got = ReadUpTo(s, record, RecordSizeV2);
+                if (got < RecordSizeV2)
+                {
+                    if (complete || (!tolerateTruncatedTail && got != 0)) throw new InvalidDataException("zstd index truncated.");
+                    break;
+                }
+
+                var uncompressedOffset = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(0));
+                var compressedOffset = BinaryPrimitives.ReadInt64LittleEndian(record.AsSpan(8));
+                var windowLength = BinaryPrimitives.ReadInt32LittleEndian(record.AsSpan(18));
+
+                if (windowLength < 0 || uncompressedOffset < 0 || compressedOffset < 0)
+                {
+                    if (tolerateTruncatedTail && !complete) break;
+                    throw new InvalidDataException("zstd index point has implausible values.");
+                }
+
+                var point = new ZstdIndexPoint(uncompressedOffset, compressedOffset, isFrameStart: record[16] != 0, windowDescriptor: record[17])
+                {
+                    WindowPositionInFile = offset + RecordSizeV2,
+                    WindowCompressedLength = windowLength,
+                };
+
+                if (eagerWindows != null)
+                {
+                    var window = new byte[windowLength];
+                    if (ReadUpTo(s, window, windowLength) < windowLength)
+                    {
+                        if (tolerateTruncatedTail && !complete) break;
+                        throw new InvalidDataException("zstd index truncated inside a window.");
+                    }
+                    if (windowLength > 0) eagerWindows[point] = window;
+                }
+                else
+                {
+                    if (s.Position + windowLength > s.Length)
+                    {
+                        if (tolerateTruncatedTail && !complete) break;
+                        throw new InvalidDataException("zstd index truncated inside a window.");
+                    }
+                    s.Seek(windowLength, SeekOrigin.Current);
+                }
+
+                offset += RecordSizeV2 + windowLength;
+                loaded.Add(point);
+            }
+
+            return new ParsedIndex { Points = loaded, TotalLength = totalLength, Complete = complete };
+        }
+
+        static int ReadUpTo(Stream s, byte[] buffer, int count)
+        {
+            var total = 0;
+            while (total < count)
+            {
+                var n = s.Read(buffer, total, count - total);
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
+        }
+
+        //================================================================= save
+
         /// <summary>Saves the index atomically (written to a temporary file, then moved over
-        /// <paramref name="indexPath"/>).</summary>
+        /// <paramref name="indexPath"/>). Always writes the current ("ZSTZRAN2") format.</summary>
         public void Save(string indexPath)
         {
-            var tempPath = indexPath + ".wip";
+            var tempPath = indexPath + ".tmp";
             using (var fs = File.Create(tempPath))
             {
                 Save(fs);
@@ -149,42 +264,52 @@ namespace ZstdSeekable
             FileHelpers.MoveOverwrite(tempPath, indexPath);
         }
 
-        /// <summary>Writes the index to <paramref name="destination"/> at its current position. The
-        /// stream is left open.</summary>
+        /// <summary>Writes a finalised index to <paramref name="destination"/> at its current
+        /// position. The stream is left open. Always writes the current ("ZSTZRAN2") format.</summary>
         public void Save(Stream destination)
         {
-            var windows = points.Select(windowSource.GetCompressedWindow).ToList();
-
-            using var bw = new BinaryWriter(destination, Encoding.UTF8, leaveOpen: true);
-            bw.Write(Magic);
-            bw.Write(UncompressedLength);
-            bw.Write(points.Count);
-
-            var windowOffset = (long)HeaderSize + (long)points.Count * RecordSize;
-            for (var i = 0; i < points.Count; i++)
+            WriteHeader(destination, UncompressedLength, points.Count);
+            var record = new byte[RecordSizeV2];
+            foreach (var point in points)
             {
-                var p = points[i];
-                p.WindowPositionInFile = windowOffset;
-                p.WindowCompressedLength = windows[i].Length;
-                windowOffset += p.WindowCompressedLength;
-
-                bw.Write(p.UncompressedOffset);
-                bw.Write(p.CompressedOffset);
-                bw.Write(p.IsFrameStart);
-                bw.Write(p.WindowDescriptor);
-                bw.Write(p.SpanMd5.Length == 16 ? p.SpanMd5 : new byte[16]);
-                bw.Write(p.WindowPositionInFile);
-                bw.Write(p.WindowCompressedLength);
+                var window = windowSource.GetCompressedWindow(point);
+                FillRecord(record, point, window.Length);
+                destination.Write(record, 0, record.Length);
+                destination.Write(window, 0, window.Length);
             }
-            foreach (var w in windows) bw.Write(w);
-            bw.Flush();
+            destination.Flush();
         }
 
-        /// <summary>Loads the index at <paramref name="indexPath"/> if it exists and is valid;
-        /// otherwise builds one from <paramref name="compressed"/> and saves it there.</summary>
+        static void WriteHeader(Stream s, long totalLength, int count)
+        {
+            var header = new byte[HeaderSize];
+            MagicV2.CopyTo(header, 0);
+            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(8), totalLength);
+            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(16), count);
+            s.Write(header, 0, header.Length);
+        }
+
+        static void FillRecord(byte[] record, ZstdIndexPoint point, int windowLength)
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(0), point.UncompressedOffset);
+            BinaryPrimitives.WriteInt64LittleEndian(record.AsSpan(8), point.CompressedOffset);
+            record[16] = point.IsFrameStart ? (byte)1 : (byte)0;
+            record[17] = point.WindowDescriptor;
+            BinaryPrimitives.WriteInt32LittleEndian(record.AsSpan(18), windowLength);
+        }
+
+        //================================================================= load-or-build
+
+        /// <summary>
+        /// Loads the index at <paramref name="indexPath"/> if it exists and is valid; otherwise
+        /// builds one from <paramref name="compressed"/> into <c>indexPath + ".wip"</c> (sealed
+        /// points are flushed as they are verified, so build memory stays flat and an interrupted
+        /// build resumes on the next call) and moves it into place when finalised.
+        /// </summary>
         public static ZstdIndex LoadOrBuild(Stream compressed, string indexPath, ZstdIndexOptions? options = null,
                                             IProgress<ZstdIndexProgress>? progress = null, CancellationToken cancellationToken = default)
         {
+            options ??= new ZstdIndexOptions();
             if (File.Exists(indexPath))
             {
                 try
@@ -193,30 +318,39 @@ namespace ZstdSeekable
                 }
                 catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException or IOException)
                 {
-                    options?.Logger?.LogWarning("Could not load zstd index {IndexPath} ({Message}). Rebuilding.", Path.GetFileName(indexPath), ex.Message);
+                    options.Logger?.LogWarning("Could not load zstd index {IndexPath} ({Message}). Rebuilding.", Path.GetFileName(indexPath), ex.Message);
                 }
             }
 
-            var index = Build(compressed, options, progress, cancellationToken);
-            index.Save(indexPath);
-            return index;
+            ValidateForBuild(compressed);
+            var wipPath = indexPath + ".wip";
+            List<ZstdIndexPoint> built;
+            long totalLength;
+            using (var wip = new FileStream(wipPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read))
+            {
+                (built, totalLength) = BuildIncremental(compressed, wip, baseOffset: 0, options, progress, cancellationToken);
+            }
+            FileHelpers.MoveOverwrite(wipPath, indexPath);
+            return new ZstdIndex(built, totalLength, new FileWindowSource(indexPath));
         }
 
         /// <summary>
         /// Loads the index from <paramref name="indexStream"/> if it holds a valid one; otherwise
-        /// builds an index from <paramref name="compressed"/> and writes it to the stream. The index
-        /// stream is always left open (the caller owns it), and must remain open while the returned
-        /// index is in use if it was loaded lazily (seekable streams).
+        /// builds one from <paramref name="compressed"/> into the stream. A seekable stream is
+        /// written incrementally (flat build memory) and an interrupted build resumes on the next
+        /// call. The index stream is always left open (the caller owns it), and must remain open
+        /// while the returned index is in use if it was loaded/built lazily (seekable streams).
         /// </summary>
         public static ZstdIndex LoadOrBuild(Stream compressed, Stream indexStream, ZstdIndexOptions? options = null,
                                             IProgress<ZstdIndexProgress>? progress = null, CancellationToken cancellationToken = default)
         {
             if (indexStream == null) throw new ArgumentNullException(nameof(indexStream));
+            options ??= new ZstdIndexOptions();
 
             if (indexStream.CanSeek)
             {
                 var basePosition = indexStream.Position;
-                if (indexStream.Length - basePosition >= HeaderSize)
+                if (indexStream.CanRead && indexStream.Length - basePosition >= HeaderSize)
                 {
                     try
                     {
@@ -224,17 +358,18 @@ namespace ZstdSeekable
                     }
                     catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException)
                     {
-                        options?.Logger?.LogWarning("Could not load the zstd index from the supplied stream ({Message}). Rebuilding.", ex.Message);
+                        options.Logger?.LogWarning("Could not load the zstd index from the supplied stream ({Message}). Building.", ex.Message);
                         indexStream.Position = basePosition;
                     }
                 }
+                if (!indexStream.CanRead || !indexStream.CanWrite)
+                    throw new ArgumentException("A seekable index stream must be readable and writable to build into.", nameof(indexStream));
 
-                var index = Build(compressed, options, progress, cancellationToken);
-                indexStream.Position = basePosition;
-                index.Save(indexStream);
+                ValidateForBuild(compressed);
+                var (built, totalLength) = BuildIncremental(compressed, indexStream, basePosition, options, progress, cancellationToken);
                 try { indexStream.SetLength(indexStream.Position); } catch (NotSupportedException) { }
                 indexStream.Flush();
-                return index;
+                return new ZstdIndex(built, totalLength, new StreamWindowSource(indexStream, basePosition, leaveOpen: true));
             }
 
             if (indexStream.CanRead && !indexStream.CanWrite)
@@ -243,53 +378,131 @@ namespace ZstdSeekable
                 return Load(indexStream, leaveOpen: true);
             }
 
-            //non-seekable writable stream: it can only be a destination
-            var built = Build(compressed, options, progress, cancellationToken);
-            built.Save(indexStream);
+            //non-seekable writable stream: it can only be a destination, and cannot be finalised
+            //in place - build in memory, then stream the complete index out
+            ValidateForBuild(compressed);
+            var index = Build(compressed, options, progress, cancellationToken);
+            index.Save(indexStream);
             indexStream.Flush();
-            return built;
+            return index;
         }
 
         //================================================================= build
 
         /// <summary>
-        /// Builds an index by decoding <paramref name="compressed"/> once from the start, planting a
-        /// verified resume point roughly every <see cref="ZstdIndexOptions.TargetSpanBytes"/> of
-        /// output, then re-decoding every span in parallel to prove it byte-identical. Frame starts
-        /// always verify, so this never fails on valid zstd input - worst case is an index with
-        /// frame-start points only (correct, but slow to seek within giant frames).
+        /// Builds an in-memory index by decoding <paramref name="compressed"/> once from the start,
+        /// verifying every resume point as it goes (see the class remarks). Never fails on valid
+        /// zstd input: in the theoretical worst case the index degrades to frame-start points only -
+        /// correct, but slow to seek within giant frames. Compressed window snapshots are held in
+        /// memory; prefer <see cref="LoadOrBuild(Stream, string, ZstdIndexOptions?, IProgress{ZstdIndexProgress}?, CancellationToken)"/>
+        /// for large streams (flat memory, resumable).
         /// </summary>
-        public static unsafe ZstdIndex Build(Stream compressed, ZstdIndexOptions? options = null,
-                                             IProgress<ZstdIndexProgress>? progress = null, CancellationToken cancellationToken = default)
+        public static ZstdIndex Build(Stream compressed, ZstdIndexOptions? options = null,
+                                      IProgress<ZstdIndexProgress>? progress = null, CancellationToken cancellationToken = default)
+        {
+            ValidateForBuild(compressed);
+            options ??= new ZstdIndexOptions();
+
+            var windows = new Dictionary<ZstdIndexPoint, byte[]>();
+            var sink = new MemorySink(windows);
+            var (built, totalLength) = BuildWithDivergenceFallback(compressed, sink, options, progress, cancellationToken);
+            return new ZstdIndex(built, totalLength, new MemoryWindowSource(windows));
+        }
+
+        static void ValidateForBuild(Stream compressed)
         {
             if (compressed == null) throw new ArgumentNullException(nameof(compressed));
             if (!compressed.CanSeek) throw new ArgumentException("The compressed stream must be seekable to build an index over it.", nameof(compressed));
+        }
 
-            options ??= new ZstdIndexOptions();
+        static (List<ZstdIndexPoint> Points, long TotalLength) BuildIncremental(Stream compressed, Stream destination, long baseOffset,
+            ZstdIndexOptions options, IProgress<ZstdIndexProgress>? progress, CancellationToken cancellationToken)
+        {
+            //an interrupted earlier build left sealed, fully verified points - keep them and continue
+            List<ZstdIndexPoint> sealedPoints = [];
+            if (destination.Length - baseOffset >= HeaderSize)
+            {
+                try
+                {
+                    destination.Position = baseOffset;
+                    var parsed = Parse(destination, eagerWindows: null, tolerateTruncatedTail: true);
+                    sealedPoints = parsed.Points;
+                }
+                catch (Exception ex) when (ex is InvalidDataException or EndOfStreamException)
+                {
+                    options.Logger?.LogWarning("Could not read the partial zstd index ({Message}). Starting fresh.", ex.Message);
+                    sealedPoints = [];
+                }
+            }
+
+            var resuming = sealedPoints.Count > 0;
+            var sink = new StreamSink(destination, baseOffset, sealedPoints);
+            try
+            {
+                return BuildWithDivergenceFallback(compressed, sink, options, progress, cancellationToken);
+            }
+            catch (InvalidDataException ex) when (resuming)
+            {
+                //e.g. the compressed stream does not match the partial index - retry from scratch
+                options.Logger?.LogWarning("Could not resume the zstd index build ({Message}). Rebuilding from scratch.", ex.Message);
+                sink.Reset();
+                return BuildWithDivergenceFallback(compressed, sink, options, progress, cancellationToken);
+            }
+        }
+
+        static (List<ZstdIndexPoint> Points, long TotalLength) BuildWithDivergenceFallback(Stream compressed, IIndexSink sink,
+            ZstdIndexOptions options, IProgress<ZstdIndexProgress>? progress, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return BuildCore(compressed, sink, options, progress, cancellationToken, options.FrameStartsOnly);
+            }
+            catch (InsuranceDivergenceException ex)
+            {
+                //divergence deeper than a whole span - never observed on real data. Degrade to
+                //frame-start-only points (always sound) rather than fail: never wrong data.
+                options.Logger?.LogWarning("{Message} Rebuilding with frame-start points only (correct, but slow to seek within large frames).", ex.Message);
+                sink.Reset();
+                return BuildCore(compressed, sink, options, progress, cancellationToken, frameStartsOnly: true);
+            }
+        }
+
+        //internal control flow only (caught by BuildWithDivergenceFallback); never escapes this class
+        sealed class InsuranceDivergenceException(long uncompressedOffset)
+            : Exception($"zstd resume state diverged deeper than a span at {uncompressedOffset:N0}.");
+
+        static unsafe (List<ZstdIndexPoint> Points, long TotalLength) BuildCore(Stream compressed, IIndexSink sink,
+            ZstdIndexOptions options, IProgress<ZstdIndexProgress>? progress, CancellationToken cancellationToken, bool frameStartsOnly)
+        {
             var logger = options.Logger;
             var targetSpanBytes = Math.Max(64 * 1024, options.TargetSpanBytes);
-            logger?.LogInformation("Creating a zstd random-access index ({Length:N0} compressed bytes).", compressed.Length);
-
-            var newPoints = new List<ZstdIndexPoint>();
-            var windows = new List<byte[]>();       //compressed window per point (parallel to newPoints)
-
-            compressed.Seek(0, SeekOrigin.Begin);
+            var sealedPoints = sink.SealedPoints;
+            var resuming = sealedPoints.Count > 0;
             var compressedTotal = compressed.Length;
+
+            if (resuming) logger?.LogInformation("Resuming the zstd random-access index ({Count:N0} verified points already sealed).", sealedPoints.Count);
+            else logger?.LogInformation("Creating a zstd random-access index ({Length:N0} compressed bytes).", compressedTotal);
+
             var reader = new ZstdBlockReader(compressed);
             using var windowCompressor = new ZstdSharp.Compressor(options.WindowCompressionLevel);
 
             var main = Methods.ZSTD_createDCtx();
             Methods.ZSTD_DCtx_setParameter(main, ZSTD_dParameter.ZSTD_d_windowLogMax, 31);
-            ZSTD_DCtx_s* trial = null;
+
+            //the two in-flight points and their shadows
+            ZstdIndexPoint? confirmed = null;       //last confirmed point; its span is still open
+            byte[] confirmedWindowRaw = [];
+            ShadowDecoder? confirmedShadow = null;  //null for frame-start points (exact by construction)
+            var confirmedAlreadyWritten = false;    //true for a re-adopted point after a resume
+            ZstdIndexPoint? candidate = null;
+            byte[] candidateWindowRaw = [];
+            ShadowDecoder? candidateShadow = null;
 
             try
             {
                 var outBuf = new byte[1 << 20];     //one block regenerates ≤128 KB
-                var trialBuf = new byte[1 << 20];
 
                 long uncompressedPos = 0;
-                var nextCandidateAt = targetSpanBytes;
-                var spanMd5 = MD5.Create();
                 long lastProgressReportAt = 0;
 
                 //rolling ring of true output (window snapshots), indexed by absolute position % windowSize
@@ -297,51 +510,26 @@ namespace ZstdSeekable
                 long frameWindowSize = 0;
                 byte frameWindowDescriptor = 0;
 
-                //at most one candidate under trial at a time. While a trial is active, output hashing
-                //is DEFERRED into `pending`: those bytes belong to the candidate's span if it is
-                //accepted (its offset precedes them), or to the current span if it is rejected.
-                ZstdIndexPoint? candidate = null;
-                byte[]? candidateWindowRaw = null;
-                var pending = new byte[TrialLookaheadBytes + (1 << 20)];
-                var pendingLength = 0;
-                long trialCompared = 0;
-
-                void FinishSpanHash()
+                //---- resume: fast-forward the true decode from the last sealed frame-start point,
+                //then re-adopt the last sealed point as the open confirmed point ----
+                long fastForwardUntil = 0;
+                var adoptPending = false;
+                ZstdIndexPoint? adoptPoint = null;
+                if (resuming)
                 {
-                    spanMd5.TransformFinalBlock([], 0, 0);
-                    if (newPoints.Count > 0) newPoints[^1].SpanMd5 = spanMd5.Hash!;
-                    spanMd5.Dispose();
-                    spanMd5 = MD5.Create();
+                    var frameStart = sealedPoints.FindLast(p => p.IsFrameStart)
+                        ?? throw new InvalidDataException("The partial zstd index has no frame-start point.");
+                    adoptPoint = sealedPoints[sealedPoints.Count - 1];
+                    adoptPending = true;
+                    fastForwardUntil = adoptPoint.UncompressedOffset;
+                    uncompressedPos = frameStart.UncompressedOffset;
+                    compressed.Seek(frameStart.CompressedOffset, SeekOrigin.Begin);
+                    lastProgressReportAt = frameStart.CompressedOffset;
+                    logger?.LogInformation("Fast-forwarding {Bytes:N0} bytes to the last verified point (a zstd point cannot checkpoint full decoder state the way a gzip point can).", fastForwardUntil - uncompressedPos);
                 }
-
-                void DropTrial(bool flushPendingIntoCurrentSpan)
+                else
                 {
-                    if (trial != null) { Methods.ZSTD_freeDCtx(trial); trial = null; }
-                    candidate = null;
-                    candidateWindowRaw = null;
-                    if (flushPendingIntoCurrentSpan && pendingLength > 0)
-                    {
-                        spanMd5.TransformBlock(pending, 0, pendingLength, null, 0);
-                    }
-                    pendingLength = 0;
-                }
-
-                void AcceptCandidate()
-                {
-                    //everything hashed so far (excluding `pending`) is the PREVIOUS span - exactly up
-                    //to the candidate's offset
-                    FinishSpanHash();
-                    newPoints.Add(candidate!);
-                    windows.Add(candidateWindowRaw!.Length == 0 ? [] : windowCompressor.Wrap(candidateWindowRaw).ToArray());
-                    nextCandidateAt = candidate!.UncompressedOffset + targetSpanBytes;
-
-                    //the deferred bytes are the start of the NEW span
-                    spanMd5.TransformBlock(pending, 0, pendingLength, null, 0);
-                    pendingLength = 0;
-
-                    if (trial != null) { Methods.ZSTD_freeDCtx(trial); trial = null; }
-                    candidate = null;
-                    candidateWindowRaw = null;
+                    compressed.Seek(0, SeekOrigin.Begin);
                 }
 
                 byte[] SnapshotWindow()
@@ -364,6 +552,41 @@ namespace ZstdSeekable
                     return snapshot;
                 }
 
+                void SealConfirmed()
+                {
+                    if (confirmed == null) return;
+                    if (!confirmedAlreadyWritten)
+                    {
+                        var windowCompressed = confirmedWindowRaw.Length == 0 ? [] : windowCompressor.Wrap(confirmedWindowRaw).ToArray();
+                        sink.Append(confirmed, windowCompressed);
+                    }
+                    confirmedAlreadyWritten = false;
+                    confirmedShadow?.Dispose();
+                    confirmedShadow = null;
+                    confirmed = null;
+                    confirmedWindowRaw = [];
+                }
+
+                void DropCandidate()
+                {
+                    candidateShadow?.Dispose();
+                    candidateShadow = null;
+                    candidate = null;
+                    candidateWindowRaw = [];
+                }
+
+                //candidate survived its whole span: it becomes the confirmed point (sealing its predecessor)
+                void PromoteCandidate()
+                {
+                    SealConfirmed();
+                    confirmed = candidate;
+                    confirmedWindowRaw = candidateWindowRaw;
+                    confirmedShadow = candidateShadow;
+                    candidate = null;
+                    candidateWindowRaw = [];
+                    candidateShadow = null;
+                }
+
                 while (true)
                 {
                     var frameStartOffset = reader.Position;
@@ -374,11 +597,32 @@ namespace ZstdSeekable
                     if (frameWindowSize > 1L << 30) throw new InvalidDataException($"zstd window {frameWindowSize:N0} too large to index.");
                     if (ring.Length < frameWindowSize) ring = new byte[frameWindowSize];
 
-                    //a frame start is a perfect (stateless) resume point
-                    FinishSpanHash();
-                    newPoints.Add(new ZstdIndexPoint(uncompressedPos, frameStartOffset, isFrameStart: true, frameWindowDescriptor));
-                    windows.Add([]);
-                    nextCandidateAt = uncompressedPos + targetSpanBytes;
+                    var fastForwarding = uncompressedPos < fastForwardUntil;
+
+                    //a frame start is a perfect (stateless) resume point: confirm it immediately
+                    if (!fastForwarding)
+                    {
+                        if (adoptPending)
+                        {
+                            //the adoption point can only coincide with a frame start here (a mid-frame
+                            //adoption happens at a block boundary inside the loop below)
+                            if (uncompressedPos != adoptPoint!.UncompressedOffset || frameStartOffset != adoptPoint.CompressedOffset)
+                                throw new InvalidDataException("The compressed stream does not match the partial index (resume position not found).");
+
+                            confirmed = adoptPoint;
+                            confirmedAlreadyWritten = true;
+                            confirmedWindowRaw = [];
+                            confirmedShadow = null;     //frame start: exact by construction
+                            adoptPending = false;
+                        }
+                        else
+                        {
+                            SealConfirmed();
+                            confirmed = new ZstdIndexPoint(uncompressedPos, frameStartOffset, isFrameStart: true, frameWindowDescriptor);
+                            confirmedWindowRaw = [];
+                            confirmedShadow = null;     //exact by construction
+                        }
+                    }
 
                     if (!ZstdFrameHelpers.Feed(main, headerBytes, outBuf, out _)) throw new InvalidDataException("zstd frame header rejected.");
 
@@ -388,32 +632,45 @@ namespace ZstdSeekable
                         cancellationToken.ThrowIfCancellationRequested();
 
                         var boundaryCompressedOffset = reader.Position;
+                        fastForwarding = uncompressedPos < fastForwardUntil;
 
-                        if (candidate == null && uncompressedPos >= nextCandidateAt)
+                        if (!fastForwarding)
                         {
-                            //arm a trial at this block boundary
-                            candidateWindowRaw = SnapshotWindow();
-                            candidate = new ZstdIndexPoint(uncompressedPos, boundaryCompressedOffset, isFrameStart: false, frameWindowDescriptor);
-                            trialCompared = 0;
-
-                            trial = Methods.ZSTD_createDCtx();
-                            Methods.ZSTD_DCtx_setParameter(trial, ZSTD_dParameter.ZSTD_d_windowLogMax, 31);
-                            var initOk = true;
-                            if (candidateWindowRaw.Length > 0)
+                            if (adoptPending)
                             {
-                                fixed (byte* windowPtr = candidateWindowRaw)
-                                {
-                                    var r = Methods.ZSTD_DCtx_refPrefix(trial, windowPtr, (nuint)candidateWindowRaw.Length);
-                                    initOk = !Methods.ZSTD_isError(r);
-                                }
+                                //fast-forward complete: re-adopt the last sealed point as the open
+                                //confirmed point, with a fresh insurance shadow from the rebuilt ring
+                                if (uncompressedPos != adoptPoint!.UncompressedOffset || boundaryCompressedOffset != adoptPoint.CompressedOffset)
+                                    throw new InvalidDataException("The compressed stream does not match the partial index (resume position not found).");
+
+                                confirmed = adoptPoint;
+                                confirmedAlreadyWritten = true;
+                                confirmedWindowRaw = SnapshotWindow();
+                                confirmedShadow = new ShadowDecoder(confirmedWindowRaw, adoptPoint.WindowDescriptor);
+                                if (!confirmedShadow.Healthy) throw new InvalidDataException("Could not re-establish the resume point's shadow decoder.");
+                                adoptPending = false;
                             }
-                            if (initOk) initOk = ZstdFrameHelpers.Feed(trial, ZstdFrameHelpers.SyntheticFrameHeader(frameWindowDescriptor), trialBuf, out _);
-                            if (!initOk) DropTrial(flushPendingIntoCurrentSpan: true);
+
+                            //confirm the candidate once it has survived one whole span byte-identical
+                            if (candidate != null && uncompressedPos >= candidate.UncompressedOffset + targetSpanBytes)
+                            {
+                                PromoteCandidate();
+                            }
+
+                            //arm a new candidate a span past the confirmed point
+                            if (!frameStartsOnly && candidate == null && confirmed != null && uncompressedPos >= confirmed.UncompressedOffset + targetSpanBytes)
+                            {
+                                candidateWindowRaw = SnapshotWindow();
+                                candidate = new ZstdIndexPoint(uncompressedPos, boundaryCompressedOffset, isFrameStart: false, frameWindowDescriptor);
+                                candidateShadow = new ShadowDecoder(candidateWindowRaw, frameWindowDescriptor);
+                                if (!candidateShadow.Healthy) DropCandidate();
+                            }
                         }
 
                         var block = reader.ReadBlock(out lastBlock);
 
                         if (!ZstdFrameHelpers.Feed(main, block, outBuf, out var produced)) throw new InvalidDataException("zstd decode error during index build.");
+                        var truth = outBuf.AsSpan(0, produced);
 
                         //rolling window ring
                         for (var copied = 0; copied < produced;)
@@ -424,31 +681,21 @@ namespace ZstdSeekable
                             copied += n;
                         }
 
-                        if (candidate != null && trial != null)
+                        if (!fastForwarding)
                         {
-                            //defer hashing while the trial is undecided; compare the trial decoder's
-                            //output for this same block against the truth
-                            Array.Copy(outBuf, 0, pending, pendingLength, produced);
-                            pendingLength += produced;
+                            //insurance shadow: covers the confirmed point's still-open span. A mismatch
+                            //here means a divergence DEEPER than a whole span (never observed on real
+                            //data) - degrade to frame-start points only. Never wrong data.
+                            if (confirmedShadow != null && !confirmedShadow.FeedAndCompare(block, truth))
+                            {
+                                throw new InsuranceDivergenceException(uncompressedPos);
+                            }
 
-                            if (!ZstdFrameHelpers.Feed(trial, block, trialBuf, out var trialProduced)
-                                || trialProduced != produced
-                                || !outBuf.AsSpan(0, produced).SequenceEqual(trialBuf.AsSpan(0, trialProduced)))
+                            //candidate shadow: divergence is normal (~12% of boundaries) - re-arm later
+                            if (candidateShadow != null && !candidateShadow.FeedAndCompare(block, truth))
                             {
-                                DropTrial(flushPendingIntoCurrentSpan: true);   //not a valid resume point; try a later boundary
+                                DropCandidate();
                             }
-                            else
-                            {
-                                trialCompared += produced;
-                                if (trialCompared >= TrialLookaheadBytes)
-                                {
-                                    AcceptCandidate();
-                                }
-                            }
-                        }
-                        else
-                        {
-                            spanMd5.TransformBlock(outBuf, 0, produced, null, 0);
                         }
 
                         uncompressedPos += produced;
@@ -456,211 +703,146 @@ namespace ZstdSeekable
                         if (reader.Position - lastProgressReportAt >= 16 * 1024 * 1024)
                         {
                             lastProgressReportAt = reader.Position;
-                            ReportScanProgress(progress, reader.Position, compressedTotal, uncompressedPos, newPoints.Count);
+                            ReportProgress(progress, reader.Position, compressedTotal, uncompressedPos, sealedPoints.Count);
                         }
                     }
 
                     reader.EndFrame(hasChecksum);
-                    DropTrial(flushPendingIntoCurrentSpan: true);   //an unresolved trial cannot span frames
+
+                    //frame end: a live candidate has verified [candidate -> frame end] = its whole
+                    //actual span (the next point will be at or after the next frame's start)
+                    if (candidate != null)
+                    {
+                        PromoteCandidate();
+                    }
                 }
 
-                FinishSpanHash();
-                spanMd5.Dispose();
+                if (adoptPending) throw new InvalidDataException("The compressed stream ended before the previously indexed position.");
+                SealConfirmed();
 
-                if (newPoints.Count == 0) throw new InvalidDataException("No zstd frames found.");
-                ReportScanProgress(progress, compressedTotal, compressedTotal, uncompressedPos, newPoints.Count);
+                if (sealedPoints.Count == 0) throw new InvalidDataException("No zstd frames found.");
 
-                logger?.LogInformation("zstd index: {Count:N0} candidate points over {Bytes:N0} bytes. Verifying every span.", newPoints.Count, uncompressedPos);
-                VerifyAndHeal(compressed, newPoints, windows, uncompressedPos, options, progress, cancellationToken);
+                sink.Finalise(uncompressedPos);
+                ReportProgress(progress, compressedTotal, compressedTotal, uncompressedPos, sealedPoints.Count);
 
-                var windowsByPoint = new Dictionary<ZstdIndexPoint, byte[]>();
-                for (var i = 0; i < newPoints.Count; i++)
-                {
-                    if (windows[i].Length > 0) windowsByPoint[newPoints[i]] = windows[i];
-                }
-
-                logger?.LogInformation("Finished the zstd index: {Count:N0} verified points.", newPoints.Count);
-                return new ZstdIndex(newPoints, uncompressedPos, new MemoryWindowSource(windowsByPoint));
+                logger?.LogInformation("Finished the zstd index: {Count:N0} verified points.", sealedPoints.Count);
+                return (sealedPoints, uncompressedPos);
             }
             finally
             {
                 Methods.ZSTD_freeDCtx(main);
-                if (trial != null) Methods.ZSTD_freeDCtx(trial);
+                confirmedShadow?.Dispose();
+                candidateShadow?.Dispose();
             }
         }
 
-        static void ReportScanProgress(IProgress<ZstdIndexProgress>? progress, long compressedProcessed, long compressedTotal, long uncompressedProduced, int pointCount)
+        static void ReportProgress(IProgress<ZstdIndexProgress>? progress, long compressedProcessed, long compressedTotal, long uncompressedProduced, int pointCount)
         {
-            var fraction = compressedTotal > 0 ? 0.5 * Math.Min(1.0, (double)compressedProcessed / compressedTotal) : 0.5;
+            var fraction = compressedTotal > 0 ? Math.Min(1.0, (double)compressedProcessed / compressedTotal) : 1.0;
             progress?.Report(new ZstdIndexProgress(ZstdIndexPhase.Scanning, compressedProcessed, compressedTotal, uncompressedProduced, pointCount, fraction));
         }
 
-        /// <summary>
-        /// The hard guarantee: re-decode every span from its point exactly as readers will, comparing
-        /// the true decode's MD5 piecewise at every candidate boundary inside the span. A point whose
-        /// resume diverges anywhere in its span gets DROPPED and its predecessor re-verified over the
-        /// merged span (the inline trial can be fooled by long stateless stretches - RLE/raw blocks
-        /// neither use nor update repeat-offset state, so a divergence can surface much later).
-        /// Healing always terminates: a frame-start resume IS the true decode, sound at any depth.
-        /// Only points whose full (possibly merged) span verified survive. Mutates
-        /// <paramref name="points"/> and <paramref name="compressedWindows"/> in place.
-        /// </summary>
-        static void VerifyAndHeal(Stream compressedStream, List<ZstdIndexPoint> points, List<byte[]> compressedWindows,
-                                  long uncompressedTotalLength, ZstdIndexOptions options,
-                                  IProgress<ZstdIndexProgress>? progress, CancellationToken cancellationToken)
+        //================================================================= build sinks
+
+        /// <summary>Where sealed (verified) points go as the build produces them.</summary>
+        interface IIndexSink
         {
-            var logger = options.Logger;
-            var streamLock = new object();
-            var markers = points;                       //every candidate stays a hash boundary
-            var alive = points.Select(_ => true).ToArray();
-            var compressedTotal = compressedStream.Length;
+            /// <summary>Already-sealed points (non-empty when resuming an interrupted build).
+            /// <see cref="Append"/> adds to this list.</summary>
+            List<ZstdIndexPoint> SealedPoints { get; }
+            void Append(ZstdIndexPoint point, byte[] windowCompressed);
+            void Finalise(long totalUncompressedLength);
+            /// <summary>Discard everything and start over (divergence fallback / failed resume).</summary>
+            void Reset();
+        }
 
-            var spansCompleted = 0;
-            var spansPlanned = points.Count;
+        sealed class MemorySink(Dictionary<ZstdIndexPoint, byte[]> windows) : IIndexSink
+        {
+            public List<ZstdIndexPoint> SealedPoints { get; } = [];
 
-            void ReportVerifyProgress()
+            public void Append(ZstdIndexPoint point, byte[] windowCompressed)
             {
-                if (progress == null) return;
-                var done = Volatile.Read(ref spansCompleted);
-                var planned = Volatile.Read(ref spansPlanned);
-                var fraction = 0.5 + 0.5 * Math.Min(1.0, planned > 0 ? (double)done / planned : 1.0);
-                progress.Report(new ZstdIndexProgress(ZstdIndexPhase.Verifying, compressedTotal, compressedTotal, uncompressedTotalLength, markers.Count, fraction));
+                point.WindowCompressedLength = windowCompressed.Length;
+                if (windowCompressed.Length > 0) windows[point] = windowCompressed;
+                SealedPoints.Add(point);
             }
 
-            //returns the marker index (a < failIdx <= b) of the first piecewise-hash mismatch, or -1 if
-            //the whole span [markers[a], nextAliveEndOffset) verified
-            int VerifySpan(int a, int b /*exclusive end marker index; markers.Count = EOF*/)
+            public void Finalise(long totalUncompressedLength) { }
+
+            public void Reset()
             {
-                var point = markers[a];
-                var endUncompressed = b < markers.Count ? markers[b].UncompressedOffset : uncompressedTotalLength;
-                var endCompressed = b < markers.Count ? markers[b].CompressedOffset : compressedStream.Length;
+                SealedPoints.Clear();
+                windows.Clear();
+            }
+        }
 
-                byte[] window = [];
-                if (compressedWindows[a].Length > 0)
+        /// <summary>Appends each sealed point (record + inline window) to a seekable stream and
+        /// flushes, so every sealed point survives an interruption. The header's counts stay zeroed
+        /// (= incomplete) until <see cref="Finalise"/> patches them.</summary>
+        sealed class StreamSink : IIndexSink
+        {
+            readonly Stream stream;
+            readonly long baseOffset;
+
+            public List<ZstdIndexPoint> SealedPoints { get; private set; }
+
+            public StreamSink(Stream stream, long baseOffset, List<ZstdIndexPoint> existingSealedPoints)
+            {
+                this.stream = stream;
+                this.baseOffset = baseOffset;
+                SealedPoints = existingSealedPoints;
+
+                if (SealedPoints.Count > 0)
                 {
-                    using var windowDecompressor = new ZstdSharp.Decompressor();
-                    window = windowDecompressor.Unwrap(compressedWindows[a]).ToArray();
+                    //continue after the last complete record (dropping any partial tail)
+                    var last = SealedPoints[SealedPoints.Count - 1];
+                    var end = baseOffset + last.WindowPositionInFile + last.WindowCompressedLength;
+                    try { stream.SetLength(end); } catch (NotSupportedException) { }
+                    stream.Position = end;
                 }
-
-                var source = new SharedStreamView(compressedStream, streamLock);
-                using var resume = new ZstdResumeStream(source, point.CompressedOffset, endCompressed, point.IsFrameStart, point.WindowDescriptor, window);
-
-                var buffer = new byte[1 << 20];
-                var position = point.UncompressedOffset;
-                var intervalIdx = a;    //hash of [markers[j], markers[j+1]) lives in markers[j].SpanMd5
-                var md5 = MD5.Create();
-                try
+                else
                 {
-                    while (position < endUncompressed)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        var intervalEnd = intervalIdx + 1 < markers.Count ? markers[intervalIdx + 1].UncompressedOffset : uncompressedTotalLength;
-                        var want = (int)Math.Min(buffer.Length, intervalEnd - position);
-                        var n = resume.Read(buffer, 0, want);
-                        if (n == 0) return intervalIdx + 1;     //short decode: treat as divergence in this interval
-                        md5.TransformBlock(buffer, 0, n, null, 0);
-                        position += n;
-
-                        if (position == intervalEnd)
-                        {
-                            md5.TransformFinalBlock([], 0, 0);
-                            var expected = markers[intervalIdx].SpanMd5;
-                            if (!md5.Hash!.AsSpan().SequenceEqual(expected)) return intervalIdx + 1;
-                            md5.Dispose();
-                            md5 = MD5.Create();
-                            intervalIdx++;
-                        }
-                    }
-                    return -1;
-                }
-                finally
-                {
-                    md5.Dispose();
+                    Reset();    //also discards any unparseable prior content
                 }
             }
 
-            //verify all currently-alive spans in parallel; drop failures; repeat for the merged spans
-            var toVerify = Enumerable.Range(0, markers.Count).Where(i => alive[i]).ToList();
-            var round = 0;
-            while (toVerify.Count > 0)
+            void WriteFreshHeader()
             {
-                round++;
-                if (round > markers.Count + 2) throw new InvalidDataException("zstd index verification did not converge.");
-
-                var dropped = new List<int>();
-                var next = new List<int>();
-
-                //each worker takes a CONTIGUOUS slice of spans, in order: a handful of sequential
-                //cursors through the compressed source instead of a random interleave (a seek storm
-                //on spinning disks - the verify pass is I/O-bound, not CPU-bound)
-                var workerCount = Math.Max(1, Math.Min(options.VerifyParallelism, toVerify.Count));
-                var ordered = toVerify.OrderBy(x => x).ToList();
-                Parallel.For(0, workerCount, w =>
-                {
-                    var from = w * ordered.Count / workerCount;
-                    var to = (w + 1) * ordered.Count / workerCount;
-                    for (var idx = from; idx < to; idx++)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        var a = ordered[idx];
-                        var b = a + 1;
-                        while (b < markers.Count && !alive[b]) b++;
-
-                        if (VerifySpan(a, b) >= 0)
-                        {
-                            lock (dropped) dropped.Add(a);
-                        }
-
-                        Interlocked.Increment(ref spansCompleted);
-                        ReportVerifyProgress();
-                    }
-                });
-
-                cancellationToken.ThrowIfCancellationRequested();
-
-                foreach (var i in dropped.OrderBy(x => x))
-                {
-                    if (markers[i].IsFrameStart)
-                    {
-                        //cannot happen (a frame-start resume is the true decode), but never drop one
-                        throw new InvalidDataException($"zstd frame-start span failed verification at {markers[i].UncompressedOffset:N0}.");
-                    }
-                    alive[i] = false;
-                    //the nearest earlier alive point now covers a longer span - re-verify it
-                    var predecessor = i - 1;
-                    while (predecessor >= 0 && !alive[predecessor]) predecessor--;
-                    if (predecessor >= 0 && !next.Contains(predecessor)) next.Add(predecessor);
-                }
-
-                if (dropped.Count > 0)
-                {
-                    Interlocked.Add(ref spansPlanned, next.Count);
-                    logger?.LogDebug("zstd index verification round {Round}: dropped {Dropped} unsound resume point(s); re-verifying {Merged} merged span(s).", round, dropped.Count, next.Count);
-                }
-
-                toVerify = next;
+                stream.Position = baseOffset;
+                WriteHeader(stream, 0, 0);      //zeroed counts mark the index incomplete
+                stream.Flush();
             }
 
-            var survivingWindows = new List<byte[]>();
-            var surviving = new List<ZstdIndexPoint>();
-            for (var i = 0; i < markers.Count; i++)
+            public void Append(ZstdIndexPoint point, byte[] windowCompressed)
             {
-                if (!alive[i]) continue;
-                surviving.Add(markers[i]);
-                survivingWindows.Add(compressedWindows[i]);
+                var record = new byte[RecordSizeV2];
+                FillRecord(record, point, windowCompressed.Length);
+                stream.Write(record, 0, record.Length);
+                point.WindowPositionInFile = stream.Position - baseOffset;
+                point.WindowCompressedLength = windowCompressed.Length;
+                stream.Write(windowCompressed, 0, windowCompressed.Length);
+                stream.Flush();     //each sealed point survives an interruption
+                SealedPoints.Add(point);
             }
 
-            if (surviving.Count < markers.Count)
-                logger?.LogInformation("zstd index: {Removed:N0} of {Total:N0} candidate points were unsound and removed; {Surviving:N0} verified points remain.", markers.Count - surviving.Count, markers.Count, surviving.Count);
+            public void Finalise(long totalUncompressedLength)
+            {
+                var end = stream.Position;
+                stream.Position = baseOffset + 8;
+                var tail = new byte[12];
+                BinaryPrimitives.WriteInt64LittleEndian(tail.AsSpan(0), totalUncompressedLength);
+                BinaryPrimitives.WriteInt32LittleEndian(tail.AsSpan(8), SealedPoints.Count);
+                stream.Write(tail, 0, tail.Length);
+                stream.Position = end;
+                stream.Flush();
+            }
 
-            points.Clear();
-            points.AddRange(surviving);
-            compressedWindows.Clear();
-            compressedWindows.AddRange(survivingWindows);
-
-            ReportVerifyProgress();
+            public void Reset()
+            {
+                SealedPoints = [];
+                try { stream.SetLength(baseOffset); } catch (NotSupportedException) { }
+                WriteFreshHeader();
+            }
         }
     }
 }

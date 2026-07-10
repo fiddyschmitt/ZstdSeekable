@@ -23,7 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Fixtures\*.zst" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

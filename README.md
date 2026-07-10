@@ -72,14 +72,15 @@ stream.Position = 40L * 1024 * 1024 * 1024;     // seek into the 40 GB mark
 
 #### How the index works (and why it's trustworthy)
 
-A zstd block can depend on decoder state beyond the content window (repeat offsets, entropy tables), so a block boundary is only usable as a resume point if a resumed decode is *bit-identical* to the true decode. The build:
+A zstd block can depend on decoder state beyond the content window (repeat offsets, entropy tables), so a block boundary is only usable as a resume point if a resumed decode is *bit-identical* to the true decode. The build is a **single sequential pass that verifies as it goes**: two shadow decoders run alongside the true decode — one for the current *candidate* point, and an *insurance* shadow covering the last confirmed point's still-open span. A candidate that stays byte-identical for a whole span is confirmed, which seals its predecessor with its entire serving span proven. A diverging candidate (normal — roughly 12% of block boundaries) is simply re-armed at a later boundary.
 
-1. **Scans** the stream once, planting a candidate resume point roughly every `TargetSpanBytes` of output. Each candidate carries a snapshot of the decoder window and is trial-decoded in parallel with the true decode for 4 MB.
-2. **Verifies** every span: each candidate is re-decoded from its resume point exactly as readers will, and byte-checked (MD5) against the true decode across its *entire* span. Unsound points are dropped and their neighbours re-verified over the merged span.
+Frame starts are stateless and always sound, so the build never fails on valid zstd input — in the theoretical worst case (an insurance divergence deeper than a whole span, never observed on real data) the index degrades to frame-start points only: coarser, never wrong. Readers additionally never serve bytes beyond a point's verified span.
 
-Frame starts are stateless and always sound, so the build never fails on valid zstd input — the worst case is a coarser index, never wrong bytes. Readers additionally never serve bytes beyond a point's verified span.
+#### Interrupted builds resume
 
-The index file format (`.zsi`) is compact: point records plus zstd-compressed window snapshots, loaded lazily on cold seeks.
+When building to a file or seekable stream (`ZstdIndex.LoadOrBuild`), each sealed point is flushed the moment it's verified — build memory stays flat (~10 MB regardless of stream size), and if the build is interrupted (crash, cancellation, lost connection), the next `LoadOrBuild` **resumes from the last sealed point** instead of starting over.
+
+The index format (`.zsi`, magic `ZSTZRAN2`) stores point records with their zstd-compressed window snapshots inline, loaded lazily on cold seeks. Indexes written by ZstdSeekable 0.1.x (`ZSTZRAN1`) still load.
 
 ## Concurrency
 

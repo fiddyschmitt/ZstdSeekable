@@ -126,7 +126,7 @@ namespace ZstdSeekable.Tests
             //truncated records
             var truncated = new byte[40];
             Array.Copy(good, truncated, truncated.Length);
-            Assert.ThrowsException<EndOfStreamException>(() => ZstdIndex.Load(new MemoryStream(truncated)));
+            Assert.ThrowsException<InvalidDataException>(() => ZstdIndex.Load(new MemoryStream(truncated)));
         }
 
         [TestMethod]

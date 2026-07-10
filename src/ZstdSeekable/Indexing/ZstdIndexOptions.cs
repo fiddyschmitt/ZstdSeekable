@@ -7,14 +7,16 @@ namespace ZstdSeekable
     public sealed class ZstdIndexOptions
     {
         /// <summary>
-        /// Target decompressed bytes per resume point. Smaller spans seek faster but make a bigger
-        /// index (each mid-frame point stores a snapshot of the decoder window, zstd-compressed).
-        /// Default 64 MiB.
+        /// Target decompressed bytes per resume point, and therefore also the depth a candidate
+        /// point must survive byte-identical before being confirmed. Smaller spans seek faster but
+        /// make a bigger index (each mid-frame point stores a snapshot of the decoder window,
+        /// zstd-compressed). Default 64 MiB.
         /// </summary>
         public long TargetSpanBytes { get; set; } = 64L * 1024 * 1024;
 
-        /// <summary>Concurrent workers for the verification pass. The pass is usually I/O-bound, so a
-        /// handful of sequential cursors beats a wide random interleave. Default min(4, cores).</summary>
+        /// <summary>Unused since 0.2.0: the single-pass build verifies every span inline (shadow
+        /// decoders alongside the true decode), so there is no separate verification pass.</summary>
+        [Obsolete("The single-pass build verifies as it goes; there is no separate verification pass. This option is ignored.")]
         public int VerifyParallelism { get; set; } = Math.Min(4, Environment.ProcessorCount);
 
         /// <summary>zstd level used to compress window snapshots inside the index. Default 3.</summary>
@@ -22,14 +24,19 @@ namespace ZstdSeekable
 
         /// <summary>Optional diagnostics logger.</summary>
         public ILogger? Logger { get; set; }
+
+        /// <summary>Test seam: plant only frame-start points (the divergence-fallback mode).</summary>
+        internal bool FrameStartsOnly { get; set; }
     }
 
     /// <summary>The phase an index build is in.</summary>
     public enum ZstdIndexPhase
     {
-        /// <summary>Sequential decode of the whole stream, planting candidate resume points.</summary>
+        /// <summary>The single sequential decode of the stream, verifying resume points inline.</summary>
         Scanning,
-        /// <summary>Re-decoding every span from its resume point to prove it byte-identical.</summary>
+        /// <summary>No longer reported since 0.2.0: verification happens inline during
+        /// <see cref="Scanning"/> (shadow decoders alongside the true decode).</summary>
+        [Obsolete("Since 0.2.0 verification happens inline during Scanning; this phase is never reported.")]
         Verifying,
     }
 
