@@ -22,4 +22,8 @@
     <ProjectReference Include="..\..\src\ZstdSeekable\ZstdSeekable.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="Fixtures\*.zst" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
