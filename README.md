@@ -76,11 +76,15 @@ A zstd block can depend on decoder state beyond the content window (repeat offse
 
 Frame starts are stateless and always sound, so the build never fails on valid zstd input — in the theoretical worst case (an insurance divergence deeper than a whole span, never observed on real data) the index degrades to frame-start points only: coarser, never wrong. Readers additionally never serve bytes beyond a point's verified span.
 
+#### Fill spans: empty space costs nothing to read
+
+Disk images are mostly empty space (zeros — or `0xFF` in flash dumps). During the build, runs of a single repeated byte longer than `ZstdIndexOptions.FillSpanThreshold` (default 1 MiB) are recorded as **fill spans**: reads inside them are served by filling the buffer directly — no window load, no decoder, no compressed I/O — roughly two orders of magnitude faster than a resume-decode. Fill spans are derived from the build's verified decode, so they can never be wrong, and they're exposed as `ZstdIndex.FillSpans` — ready-made sparse-extent metadata for consumers (e.g. mounted filesystem images).
+
 #### Interrupted builds resume
 
-When building to a file or seekable stream (`ZstdIndex.LoadOrBuild`), each sealed point is flushed the moment it's verified — build memory stays flat (~10 MB regardless of stream size), and if the build is interrupted (crash, cancellation, lost connection), the next `LoadOrBuild` **resumes from the last sealed point** instead of starting over.
+When building to a file or seekable stream (`ZstdIndex.LoadOrBuild`), each verified record is flushed the moment it's sealed — build memory stays flat (~10 MB regardless of stream size), and if the build is interrupted (crash, cancellation, lost connection), the next `LoadOrBuild` **resumes from the last sealed point** instead of starting over.
 
-The index format (`.zsi`, magic `ZSTZRAN2`) stores point records with their zstd-compressed window snapshots inline, loaded lazily on cold seeks. Indexes written by ZstdSeekable 0.1.x (`ZSTZRAN1`) still load.
+The index format (`.zsi`, magic `ZSTZRAN3`) is a sequence of typed records — frame-start points, mid-frame points with their zstd-compressed window snapshots inline (loaded lazily on cold seeks), and fill spans — appended in the order they are proven. Indexes written by older versions (`ZSTZRAN1`, `ZSTZRAN2`) still load.
 
 ## Concurrency
 

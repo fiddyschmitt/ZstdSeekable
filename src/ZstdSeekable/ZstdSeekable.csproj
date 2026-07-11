@@ -10,8 +10,8 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>ZstdSeekable</PackageId>
-    <Version>0.2.0</Version>
-    <PackageReleaseNotes>Index builds are now a single verified pass (~35% faster), use flat memory when building to a file/seekable stream, and resume after interruption. New ZSTZRAN2 index format (ZSTZRAN1 files still load).</PackageReleaseNotes>
+    <Version>0.3.0</Version>
+    <PackageReleaseNotes>Fill spans: long single-byte runs (zeros in disk images, 0xFF in flash dumps) are recorded in the index and served without touching the decoder - reads over empty space become ~free, and ZstdIndex.FillSpans exposes them as sparse-extent metadata. New ZSTZRAN3 typed-record index format (ZSTZRAN1/2 files still load).</PackageReleaseNotes>
     <Authors>fiddyschmitt</Authors>
     <Description>Random-access (seekable) reading of zstandard streams: reads and writes the official zstd seekable format, and builds a verified resume-point index for ordinary (non-seekable) zstd streams.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

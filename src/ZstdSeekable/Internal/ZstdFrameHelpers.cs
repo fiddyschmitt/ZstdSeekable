@@ -59,6 +59,34 @@ namespace ZstdSeekable.Internal
             return true;
         }
 
+        /// <summary>Index of the first byte differing from <paramref name="value"/>, or -1.</summary>
+        public static int IndexOfNot(ReadOnlySpan<byte> span, byte value)
+        {
+#if NET8_0_OR_GREATER
+            return span.IndexOfAnyExcept(value);
+#else
+            for (var i = 0; i < span.Length; i++)
+            {
+                if (span[i] != value) return i;
+            }
+            return -1;
+#endif
+        }
+
+        /// <summary>Index of the last byte differing from <paramref name="value"/>, or -1.</summary>
+        public static int LastIndexOfNot(ReadOnlySpan<byte> span, byte value)
+        {
+#if NET8_0_OR_GREATER
+            return span.LastIndexOfAnyExcept(value);
+#else
+            for (var i = span.Length - 1; i >= 0; i--)
+            {
+                if (span[i] != value) return i;
+            }
+            return -1;
+#endif
+        }
+
         /// <summary>Decode-and-discard <paramref name="count"/> bytes from a forward-only stream.</summary>
         public static void Skip(Stream stream, long count, byte[] scratch)
         {

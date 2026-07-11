@@ -9,7 +9,8 @@ namespace ZstdSeekable
     /// Random-access view over a standard zstd stream, backed by a <see cref="ZstdIndex"/> of
     /// verified resume points (see <see cref="ZstdIndexPoint"/> for why points must be verified).
     /// A read within a span resumes decoding at the span's point and decodes forward, so seek cost is
-    /// bounded by the index's span size. One instance is not thread-safe; use
+    /// bounded by the index's span size; reads inside a <see cref="ZstdFillSpan"/> skip the decoder
+    /// entirely and just fill the buffer. One instance is not thread-safe; use
     /// <see cref="CreateView"/> for cheap independent cursors over the same source.
     /// </summary>
     public sealed class ZstdIndexedStream : Stream
@@ -19,6 +20,7 @@ namespace ZstdSeekable
         readonly bool ownsSource;
         readonly bool ownsIndex;
         readonly List<Mapping> mappings;
+        readonly IReadOnlyList<ZstdFillSpan> fillSpans;
         long position;
         byte[]? skipScratch;
 
@@ -40,6 +42,7 @@ namespace ZstdSeekable
             this.ownsSource = ownsSource;
             this.ownsIndex = ownsIndex;
             this.gate = gate;
+            fillSpans = index.FillSpans;
 
             mappings = new List<Mapping>(index.Points.Count);
             for (var i = 0; i < index.Points.Count; i++)
@@ -69,6 +72,20 @@ namespace ZstdSeekable
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (count == 0) return 0;
 
+            //fill-span fast path: bytes inside a recorded single-byte run are produced directly -
+            //no window load, no decoder, no compressed I/O
+            var fillIndex = FillSpanMap.Find(fillSpans, position);
+            if (fillIndex >= 0)
+            {
+                var fill = fillSpans[fillIndex];
+                var bytesLeftInFill = fill.UncompressedOffset + fill.Length - position;
+                var filled = (int)Math.Min(count, Math.Min(bytesLeftInFill, Length - position));
+                if (filled <= 0) return 0;
+                buffer.AsSpan(offset, filled).Fill(fill.FillByte);
+                position += filled;
+                return filled;
+            }
+
             var chunk = BlockMap.Find(mappings, position);
             if (chunk == null) return 0;
 
@@ -77,6 +94,11 @@ namespace ZstdSeekable
             //the caller re-enter at the next chunk.
             var bytesLeftInChunk = chunk.UncompressedEndByte - position;
             count = (int)Math.Min(count, bytesLeftInChunk);
+
+            //stop at the next fill span, so the following read takes the fast path instead of
+            //decoding bytes we could produce for free
+            var nextFillStart = FillSpanMap.NextStart(fillSpans, position);
+            if (nextFillStart < position + count) count = (int)(nextFillStart - position);
 
             var point = Index.Points[chunk.Tag];
             var positionInChunk = position - chunk.UncompressedStartByte;

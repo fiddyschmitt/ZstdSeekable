@@ -22,6 +22,14 @@ namespace ZstdSeekable
         /// <summary>zstd level used to compress window snapshots inside the index. Default 3.</summary>
         public int WindowCompressionLevel { get; set; } = 3;
 
+        /// <summary>
+        /// Minimum length of a single-repeated-byte run (zeros in disk images, 0xFF in flash dumps)
+        /// to record as a <see cref="ZstdFillSpan"/>, letting reads inside it skip decompression
+        /// entirely. Clamped to ≥256 KiB; set to <see cref="long.MaxValue"/> to disable.
+        /// Default 1 MiB.
+        /// </summary>
+        public long FillSpanThreshold { get; set; } = 1024 * 1024;
+
         /// <summary>Optional diagnostics logger.</summary>
         public ILogger? Logger { get; set; }
 

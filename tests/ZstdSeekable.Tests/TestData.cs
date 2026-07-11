@@ -54,6 +54,34 @@ namespace ZstdSeekable.Tests
             return bytes;
         }
 
+        /// <summary>Long runs of a single byte value (e.g. 0xFF for erased flash) with compressible
+        /// text islands between them.</summary>
+        public static byte[] FillRunBytes(int seed, int length, byte fillByte)
+        {
+            var random = new Random(seed);
+            var bytes = new byte[length];
+            for (var i = 0; i < length; i++) bytes[i] = fillByte;
+
+            var position = 0;
+            while (position < length)
+            {
+                position += random.Next(300_000, 900_000);      //leave a run of fillByte
+                if (position >= length) break;
+                var islandEnd = Math.Min(position + random.Next(30_000, 100_000), length);
+                while (position < islandEnd)
+                {
+                    var word = Words[random.Next(Words.Length)];
+                    foreach (var c in word)
+                    {
+                        if (position >= islandEnd) break;
+                        bytes[position++] = (byte)c;
+                    }
+                    if (position < islandEnd) bytes[position++] = (byte)' ';
+                }
+            }
+            return bytes;
+        }
+
         /// <summary>Incompressible noise.</summary>
         public static byte[] RandomBytes(int seed, int length)
         {
