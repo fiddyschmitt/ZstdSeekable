@@ -10,8 +10,8 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
     <PackageId>ZstdSeekable</PackageId>
-    <Version>0.3.0</Version>
-    <PackageReleaseNotes>Fill spans: long single-byte runs (zeros in disk images, 0xFF in flash dumps) are recorded in the index and served without touching the decoder - reads over empty space become ~free, and ZstdIndex.FillSpans exposes them as sparse-extent metadata. New ZSTZRAN3 typed-record index format (ZSTZRAN1/2 files still load).</PackageReleaseNotes>
+    <Version>0.4.0</Version>
+    <PackageReleaseNotes>Exact decoder-state resume points: each mid-frame point now snapshots the full carried zstd decoder state (entropy tables, repeat offsets, table-selector classification and flags) alongside the window, so EVERY block boundary at the target spacing is accepted - 100% boundary acceptance, no dropped candidates, no divergence fallback, and the build is a single decode pass (a small sample of spans is still byte-verified as an integration check). Interrupted builds resume from the last sealed point via exact restore (no fast-forward decode), guarded by a compressed-stream fingerprint. New ZSTZRAN4 index format (ZSTZRAN1/2/3 files still load and serve unchanged).</PackageReleaseNotes>
     <Authors>fiddyschmitt</Authors>
     <Description>Random-access (seekable) reading of zstandard streams: reads and writes the official zstd seekable format, and builds a verified resume-point index for ordinary (non-seekable) zstd streams.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

@@ -104,9 +104,10 @@ namespace ZstdSeekable
             var positionInChunk = position - chunk.UncompressedStartByte;
 
             var window = Index.LoadWindow(point);
+            var exactState = Index.LoadExactState(point);   //non-null only for v4 exact points
             var source = new SharedStreamView(compressed, gate);
             using var resume = new ZstdResumeStream(source, chunk.CompressedStartByte, chunk.CompressedEndByte,
-                                                    point.IsFrameStart, point.WindowDescriptor, window);
+                                                    point.IsFrameStart, point.WindowDescriptor, window, exactState);
 
             if (positionInChunk > 0)
             {

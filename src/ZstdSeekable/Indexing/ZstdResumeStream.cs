@@ -11,9 +11,12 @@ namespace ZstdSeekable
     /// header, or a mid-frame block boundary reached via a synthetic frame header +
     /// ZSTD_DCtx_refPrefix of the point's window) and reads compressed bytes from
     /// <paramref name="compressedStart"/> up to <paramref name="compressedEnd"/>. The window array is
-    /// pinned for the stream's lifetime (refPrefix references it directly).
+    /// pinned for the stream's lifetime (refPrefix references it directly). When
+    /// <paramref name="exactState"/> is supplied (a v4 exact point), the captured entropy tables,
+    /// repeat offsets, table-selector pointers and flags are reinstated right after the synthetic
+    /// frame header is consumed - making the resume exact by construction.
     /// </summary>
-    internal sealed unsafe class ZstdResumeStream(Stream source, long compressedStart, long compressedEnd, bool isFrameStart, byte windowDescriptor, byte[] window) : Stream
+    internal sealed unsafe class ZstdResumeStream(Stream source, long compressedStart, long compressedEnd, bool isFrameStart, byte windowDescriptor, byte[] window, ZstdExactState? exactState = null) : Stream
     {
         ZSTD_DCtx_s* dctx;
         GCHandle windowPin;
@@ -65,6 +68,9 @@ namespace ZstdSeekable
                                 if (Methods.ZSTD_isError(r)) throw new InvalidDataException($"zstd resume header rejected: {Methods.ZSTD_getErrorName(r)}");
                             }
                         }
+                        //v4 exact point: the frame init (run while consuming the header) reset the
+                        //entropy state - reinstate the snapshot now, before the first block
+                        exactState?.Restore(dctx);
                         headerFed = true;
                         continue;
                     }

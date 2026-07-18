@@ -7,12 +7,22 @@ namespace ZstdSeekable
     public sealed class ZstdIndexOptions
     {
         /// <summary>
-        /// Target decompressed bytes per resume point, and therefore also the depth a candidate
-        /// point must survive byte-identical before being confirmed. Smaller spans seek faster but
-        /// make a bigger index (each mid-frame point stores a snapshot of the decoder window,
-        /// zstd-compressed). Default 64 MiB.
+        /// Target decompressed bytes per resume point. Smaller spans seek faster but make a bigger
+        /// index (each mid-frame point stores a snapshot of the decoder window plus its entropy
+        /// state, zstd-compressed). Since 0.4.0 every block boundary at the target spacing is
+        /// accepted (points carry the exact decoder state), so spans are uniform. Default 64 MiB.
         /// </summary>
         public long TargetSpanBytes { get; set; } = 64L * 1024 * 1024;
+
+        /// <summary>
+        /// How many resume-point spans to byte-verify against a shadow decoder during the build.
+        /// A 0.4.0 point captures the decoder state EXACTLY, so it restores perfectly or not at
+        /// all - and every point uses the identical code path, so verifying the first few confirms
+        /// the machinery for this stream while the rest are correct by construction. A sampled
+        /// mismatch is a hard error (it would indicate a bug), never healed. Set very large to
+        /// verify every span. Default 3.
+        /// </summary>
+        public int VerifiedSampleSpans { get; set; } = 3;
 
         /// <summary>Unused since 0.2.0: the single-pass build verifies every span inline (shadow
         /// decoders alongside the true decode), so there is no separate verification pass.</summary>

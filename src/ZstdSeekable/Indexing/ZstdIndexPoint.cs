@@ -26,6 +26,21 @@
         internal long WindowPositionInFile;     //where this point's zstd-compressed window sits, relative to the index's first byte
         internal int WindowCompressedLength;    //0 = no window (frame starts)
 
+        // ---- exact-state (v4, "ZSTZRAN4") mid-frame points: the full carried decoder state ----
+
+        /// <summary>True for a v4 point that carries an exact decoder-state snapshot (entropy
+        /// tables + rep offsets + table-selector classification + flags); false for frame starts
+        /// and for legacy v1-v3 window-prefix points (which serve via the verified-span path).</summary>
+        internal bool IsExact;
+
+        internal byte FrameHasChecksum;         //the ORIGINAL frame declares a trailing checksum (needed to finish the frame when a build resumes here)
+        internal byte LitEntropy;
+        internal byte FseEntropy;
+        internal byte[] PtrClasses = System.Array.Empty<byte>();   //4 symbolic table-selector classes (ZstdExactState.Ptr*)
+        internal int[] PtrOffsets = System.Array.Empty<int>();     //4 entropy-relative offsets (used when class == PtrEntropy)
+        internal long EntropyPositionInFile;    //where this point's zstd-compressed entropy blob sits, relative to the index's first byte
+        internal int EntropyCompressedLength;   //0 = none (non-exact points)
+
         internal ZstdIndexPoint(long uncompressedOffset, long compressedOffset, bool isFrameStart, byte windowDescriptor)
         {
             UncompressedOffset = uncompressedOffset;
